@@ -979,7 +979,7 @@ func (as *AllocationSet) AggregateBy(aggregateBy []string, options *AllocationAg
 	}
 
 	// (2c) Convert SharedHourlyCosts to Allocations in the shareSet. This must
-	// come after idle coefficients are computes so that allocations generated
+	// come after idle coefficients are computed so that allocations generated
 	// by shared overhead do not skew the idle coefficient computation.
 	for name, cost := range options.SharedHourlyCosts {
 		if cost > 0.0 {

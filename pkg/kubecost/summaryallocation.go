@@ -1,6 +1,7 @@
 package kubecost
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -302,7 +303,7 @@ func (sas *SummaryAllocationSet) AggregateBy(aggregateBy []string, options *Allo
 	//        must happen after (2a) and (2b)
 	//     d) if there are shared resources, compute share coefficients
 	//
-	//  TODO (SQL)
+	//  TODO (Move upstream to the StorageStrategy.Get() call; SQL?)
 	//  3. Drop any allocation that fails any of the filters
 	//
 	//  TODO (from precomputed)
@@ -418,6 +419,48 @@ func (sas *SummaryAllocationSet) AggregateBy(aggregateBy []string, options *Allo
 	// (4) Distribute idle cost (TODO using precomputed)
 	// (5) Aggregate
 	for _, sa := range sas.SummaryAllocations {
+		// (4) Distribute idle allocations according to the idle coefficients
+		// NOTE: if idle allocation is off (i.e. ShareIdle == ShareNone) then
+		// all idle allocations will be in the aggSet at this point, so idleSet
+		// will be empty and we won't enter this block.
+		// if idleSet.Length() > 0 {
+		// 	// Distribute idle allocations by coefficient per-idleId, per-allocation
+		// 	for _, idleAlloc := range idleSet.allocations {
+		// 		// Only share idle if the idleId matches; i.e. the allocation
+		// 		// is from the same idleId as the idle costs
+		// 		iaidleId, err := idleAlloc.getIdleId(options)
+		// 		if err != nil {
+		// 			log.Errorf("AllocationSet.AggregateBy: Idle allocation is missing idleId %s", idleAlloc.Name)
+		// 			return err
+		// 		}
+
+		// 		if iaidleId != idleId {
+		// 			continue
+		// 		}
+
+		// 		// Make sure idle coefficients exist
+		// 		if _, ok := idleCoefficients[idleId]; !ok {
+		// 			log.Warningf("AllocationSet.AggregateBy: error getting idle coefficient: no idleId '%s' for '%s'", idleId, alloc.Name)
+		// 			continue
+		// 		}
+		// 		if _, ok := idleCoefficients[idleId][alloc.Name]; !ok {
+		// 			log.Warningf("AllocationSet.AggregateBy: error getting idle coefficient for '%s'", alloc.Name)
+		// 			continue
+		// 		}
+
+		// 		alloc.CPUCoreHours += idleAlloc.CPUCoreHours * idleCoefficients[idleId][alloc.Name]["cpu"]
+		// 		alloc.GPUHours += idleAlloc.GPUHours * idleCoefficients[idleId][alloc.Name]["gpu"]
+		// 		alloc.RAMByteHours += idleAlloc.RAMByteHours * idleCoefficients[idleId][alloc.Name]["ram"]
+
+		// 		idleCPUCost := idleAlloc.CPUCost * idleCoefficients[idleId][alloc.Name]["cpu"]
+		// 		idleGPUCost := idleAlloc.GPUCost * idleCoefficients[idleId][alloc.Name]["gpu"]
+		// 		idleRAMCost := idleAlloc.RAMCost * idleCoefficients[idleId][alloc.Name]["ram"]
+		// 		alloc.CPUCost += idleCPUCost
+		// 		alloc.GPUCost += idleGPUCost
+		// 		alloc.RAMCost += idleRAMCost
+		// 	}
+		// }
+
 		// (5) generate key to use for aggregation-by-key and allocation name
 		key := sa.generateKey(aggregateBy, options.LabelConfig)
 
@@ -457,6 +500,68 @@ func (sas *SummaryAllocationSet) AggregateBy(aggregateBy []string, options *Allo
 
 	// Replace the existing set's data with the new, aggregated summary data
 	sas.SummaryAllocations = aggSet.SummaryAllocations
+
+	return nil
+}
+
+func (sas *SummaryAllocationSet) InsertIdleSummaryAllocations(rts map[string]*ResourceTotals, prop AssetProperty) error {
+	if sas == nil {
+		return errors.New("cannot compute idle allocation for nil SummaryAllocationSet")
+	}
+
+	if len(rts) == 0 {
+		return nil
+	}
+
+	// TODO argh avoid copy? Not the worst thing at this size... O(clusters) or O(nodes)
+	idleTotals := make(map[string]*ResourceTotals, len(rts))
+	for key, rt := range rts {
+		idleTotals[key] = &ResourceTotals{
+			Start:   rt.Start,
+			End:     rt.End,
+			CPUCost: rt.CPUCost,
+			GPUCost: rt.GPUCost,
+			RAMCost: rt.RAMCost,
+		}
+	}
+
+	// Subtract allocated costs from resource totals, leaving only the remaining
+	// idle totals for each key (cluster or node).
+	sas.Each(func(name string, sa *SummaryAllocation) {
+		key := sa.Properties.Cluster
+		if prop == AssetNodeProp {
+			key = sa.Properties.Node
+		}
+
+		if _, ok := idleTotals[key]; !ok {
+			// Failed to find totals for the allocation's cluster or node.
+			// (Should never happen.)
+			log.Warningf("InsertIdleSummaryAllocations: failed to find %s: %s", prop, key)
+			return
+		}
+
+		idleTotals[key].CPUCost -= sa.CPUCost
+		idleTotals[key].GPUCost -= sa.GPUCost
+		idleTotals[key].RAMCost -= sa.RAMCost
+	})
+
+	// Turn remaining idle totals into idle allocations and insert them.
+	for key, rt := range idleTotals {
+		idleAlloc := &SummaryAllocation{
+			Name: fmt.Sprintf("%s/%s", key, IdleSuffix),
+			Properties: &AllocationProperties{
+				Cluster: rt.Cluster,
+				Node:    rt.Node,
+			},
+			Start:   rt.Start,
+			End:     rt.End,
+			CPUCost: rt.CPUCost,
+			GPUCost: rt.GPUCost,
+			RAMCost: rt.RAMCost,
+		}
+
+		sas.Insert(idleAlloc)
+	}
 
 	return nil
 }
