@@ -1015,6 +1015,9 @@ func (as *AllocationSet) AggregateBy(aggregateBy []string, options *AllocationAg
 		}
 	}
 
+	filtered := 0
+	unfiltered := 0
+
 	// (3-5) Filter, distribute idle cost, and aggregate (in that order)
 	for _, alloc := range as.allocations {
 		idleId, err := alloc.getIdleId(options)
@@ -1042,8 +1045,12 @@ func (as *AllocationSet) AggregateBy(aggregateBy []string, options *AllocationAg
 				}
 			}
 
+			filtered++
+
 			continue
 		}
+
+		unfiltered++
 
 		// (4) Distribute idle allocations according to the idle coefficients
 		// NOTE: if idle allocation is off (i.e. ShareIdle == ShareNone) then
@@ -1099,6 +1106,8 @@ func (as *AllocationSet) AggregateBy(aggregateBy []string, options *AllocationAg
 		// perform the actual basic aggregation step.
 		aggSet.Insert(alloc)
 	}
+
+	log.Infof("SummaryAllocation: Allocation comparison: %d allocations (%d filtered)", unfiltered, filtered)
 
 	// (6) If idle is shared and resources are shared, it's possible that some
 	// amount of idle cost will be shared with a shared resource. Distribute

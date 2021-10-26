@@ -211,19 +211,51 @@ type SummaryAllocationSet struct {
 	Window             Window                        `json:"window"`
 }
 
-func NewSummaryAllocationSet(as *AllocationSet) *SummaryAllocationSet {
+func NewSummaryAllocationSet(as *AllocationSet, ffs ...AllocationMatchFunc) *SummaryAllocationSet {
 	if as == nil {
 		return nil
 	}
 
+	// TODO comment in function
+	var sasMap map[string]*SummaryAllocation
+	if len(ffs) == 0 {
+		// No filters, so make the map of summary allocations exactly the size
+		// of the origin allocation set.
+		sasMap = make(map[string]*SummaryAllocation, len(as.allocations))
+	} else {
+		// There are filters, so start with a standard map
+		sasMap = make(map[string]*SummaryAllocation)
+	}
+
 	sas := &SummaryAllocationSet{
-		SummaryAllocations: make(map[string]*SummaryAllocation, len(as.allocations)),
+		SummaryAllocations: sasMap,
 		Window:             as.Window.Clone(),
 	}
 
+	filtered := 0
+	unfiltered := 0
+
 	for _, alloc := range as.allocations {
-		sas.SummaryAllocations[alloc.Name] = NewSummaryAllocation(alloc)
+		shouldInsert := true
+		for _, ff := range ffs {
+			if !ff(alloc) {
+				shouldInsert = false
+				break
+			}
+		}
+
+		if shouldInsert {
+			unfiltered++
+			err := sas.Insert(NewSummaryAllocation(alloc))
+			if err != nil {
+				log.Errorf("SummaryAllocation: error inserting summary of %s", alloc.Name)
+			}
+		} else {
+			filtered++
+		}
 	}
+
+	log.Infof("SummaryAllocation: %d allocations (%d filtered)", unfiltered, filtered)
 
 	for key := range as.externalKeys {
 		sas.externalKeys[key] = true
@@ -381,7 +413,7 @@ func (sas *SummaryAllocationSet) AggregateBy(aggregateBy []string, options *Allo
 	defer sas.Unlock()
 
 	// TODO
-	log.Infof("SummaryAllocation: idle: %s (%d idle allocs)", options.ShareIdle, len(sas.idleKeys))
+	log.Infof("SummaryAllocation: shareIdle: %s, %d idle allocs", options.ShareIdle, len(sas.idleKeys))
 
 	// (1) Loop and find all of the external, idle, and shared allocations. Add
 	// them to their respective sets, removing them from the set of allocations
@@ -418,12 +450,22 @@ func (sas *SummaryAllocationSet) AggregateBy(aggregateBy []string, options *Allo
 
 	// (2) Idle and share coefficients (TODO)
 
-	// (3) Filter (TODO, SQL)
-	// (4) Distribute idle cost (TODO using precomputed)
+	log.Infof("SummaryAllocation: %d idle allocations", len(idleSet.SummaryAllocations))
+	log.Infof("SummaryAllocation: %d idle keys", len(aggSet.idleKeys))
+
+	// TODO remove from the steps!
+	// (3) Filter
+
+	var filteredTotals map[string]*ResourceTotals
+	if len(aggSet.idleKeys) > 0 && len(options.FilterFuncs) > 0 {
+		filteredTotals = make(map[string]*ResourceTotals, len(aggSet.idleKeys))
+	}
+
+	log.Infof("SummaryAllocation: has filtered totals %t", filteredTotals != nil)
+
+	// (4) Distribute idle cost
 	// (5) Aggregate
 	for _, sa := range sas.SummaryAllocations {
-		log.Infof("SummaryAllocation: %d idle allocations", len(idleSet.SummaryAllocations))
-
 		// (4) Distribute idle allocations according to the idle coefficients
 		// NOTE: if idle allocation is off (i.e. ShareIdle == ShareNone) then
 		// all idle allocations will be in the aggSet at this point, so idleSet
@@ -485,6 +527,31 @@ func (sas *SummaryAllocationSet) AggregateBy(aggregateBy []string, options *Allo
 			sa.Name = UnallocatedSuffix
 		}
 
+		// TODO do we need to be going off of "cluster/node" for "node" in all these places?
+
+		// Record filtered resource totals for idle allocation filtration, if
+		// necessary
+		if filteredTotals != nil {
+			var key string
+			if options.IdleByNode {
+				key = sa.Properties.Node
+			} else {
+				key = sa.Properties.Cluster
+			}
+
+			if _, ok := filteredTotals[key]; ok {
+				filteredTotals[key].CPUCost += sa.CPUCost
+				filteredTotals[key].GPUCost += sa.GPUCost
+				filteredTotals[key].RAMCost += sa.RAMCost
+			} else {
+				filteredTotals[key] = &ResourceTotals{
+					CPUCost: sa.CPUCost,
+					GPUCost: sa.GPUCost,
+					RAMCost: sa.RAMCost,
+				}
+			}
+		}
+
 		// Inserting the allocation with the generated key for a name will
 		// perform the actual aggregation step.
 		aggSet.Insert(sa)
@@ -492,7 +559,57 @@ func (sas *SummaryAllocationSet) AggregateBy(aggregateBy []string, options *Allo
 
 	// (6) Distribute idle to shared resources (TODO)
 
-	// (7) Apply idle filtration (TODO)
+	// (7) Apply idle filtration
+	if filteredTotals != nil {
+		for idleKey := range aggSet.idleKeys {
+			log.Infof("SummaryAllocation: computing filter coefficients for %s", idleKey)
+
+			ia := aggSet.SummaryAllocations[idleKey]
+
+			var allocTotals map[string]*ResourceTotals
+			var key string
+			if options.IdleByNode {
+				key = ia.Properties.Node
+
+				allocTotals = options.AllocationResourceTotalsStore.GetResourceTotalsByNode(*sas.Window.Start(), *sas.Window.End())
+				if allocTotals == nil {
+					// TODO
+					log.Warningf("SummaryAllocation: nil allocTotals by node for %s", sas.Window)
+				}
+			} else {
+				key = ia.Properties.Cluster
+
+				allocTotals = options.AllocationResourceTotalsStore.GetResourceTotalsByCluster(*sas.Window.Start(), *sas.Window.End())
+				if allocTotals == nil {
+					// TODO
+					log.Warningf("SummaryAllocation: nil allocTotals by cluster for %s", sas.Window)
+				}
+			}
+
+			// Percentage of idle that should remain after filters are applied,
+			// which equals the proportion of filtered-to-actual cost.
+			cpuFilterCoeff := 0.0
+			if allocTotals[key].CPUCost > 0.0 {
+				cpuFilterCoeff = filteredTotals[key].CPUCost / allocTotals[key].CPUCost
+			}
+
+			gpuFilterCoeff := 0.0
+			if allocTotals[key].RAMCost > 0.0 {
+				gpuFilterCoeff = filteredTotals[key].RAMCost / allocTotals[key].RAMCost
+			}
+
+			ramFilterCoeff := 0.0
+			if allocTotals[key].RAMCost > 0.0 {
+				ramFilterCoeff = filteredTotals[key].RAMCost / allocTotals[key].RAMCost
+			}
+
+			log.Infof("SummaryAllocation: idle filter coeffs: %.3f, %.3f, %.3f", cpuFilterCoeff, gpuFilterCoeff, ramFilterCoeff)
+
+			ia.CPUCost *= cpuFilterCoeff
+			ia.GPUCost *= gpuFilterCoeff
+			ia.RAMCost *= ramFilterCoeff
+		}
+	}
 
 	// (8) Distribute shared resources (TODO)
 
