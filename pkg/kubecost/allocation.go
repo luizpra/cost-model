@@ -743,15 +743,16 @@ func NewAllocationSet(start, end time.Time, allocs ...*Allocation) *AllocationSe
 // succeeds, the allocation is marked as a shared resource. ShareIdle is a
 // simple flag for sharing idle resources.
 type AllocationAggregationOptions struct {
-	FilterFuncs       []AllocationMatchFunc
-	IdleByNode        bool
-	LabelConfig       *LabelConfig
-	MergeUnallocated  bool
-	SharedHourlyCosts map[string]float64
-	ShareFuncs        []AllocationMatchFunc
-	ShareIdle         string
-	ShareSplit        string
-	SplitIdle         bool
+	AllocationResourceTotalsStore ResourceTotalsStore
+	FilterFuncs                   []AllocationMatchFunc
+	IdleByNode                    bool
+	LabelConfig                   *LabelConfig
+	MergeUnallocated              bool
+	SharedHourlyCosts             map[string]float64
+	ShareFuncs                    []AllocationMatchFunc
+	ShareIdle                     string
+	ShareSplit                    string
+	SplitIdle                     bool
 }
 
 // AggregateBy aggregates the Allocations in the given AllocationSet by the given

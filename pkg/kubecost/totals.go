@@ -19,10 +19,51 @@ type ResourceTotals struct {
 	RAMCost float64 `json:"ram"`
 }
 
-func ComputeResourceTotals(as *AssetSet, prop AssetProperty) map[string]*ResourceTotals {
+func ComputeResourceTotalsFromAllocations(as *AllocationSet, prop string) map[string]*ResourceTotals {
 	rts := map[string]*ResourceTotals{}
 
-	as.Each(func(key string, asset Asset) {
+	as.Each(func(name string, alloc *Allocation) {
+		// Default to computing totals by Cluster, but allow override to use Node.
+		key := alloc.Properties.Cluster
+		if prop == AllocationNodeProp {
+			key = alloc.Properties.Node
+		}
+
+		if rt, ok := rts[key]; ok {
+			if rt.Start.After(alloc.Start) {
+				rt.Start = alloc.Start
+			}
+			if rt.End.Before(alloc.End) {
+				rt.End = alloc.End
+			}
+
+			if rt.Node != alloc.Properties.Node {
+				rt.Node = ""
+			}
+
+			rt.CPUCost += alloc.CPUTotalCost()
+			rt.RAMCost += alloc.RAMTotalCost()
+			rt.GPUCost += alloc.GPUTotalCost()
+		} else {
+			rts[key] = &ResourceTotals{
+				Start:   alloc.Start,
+				End:     alloc.End,
+				Cluster: alloc.Properties.Cluster,
+				Node:    alloc.Properties.Node,
+				CPUCost: alloc.CPUTotalCost(),
+				RAMCost: alloc.RAMTotalCost(),
+				GPUCost: alloc.GPUTotalCost(),
+			}
+		}
+	})
+
+	return rts
+}
+
+func ComputeResourceTotalsFromAssets(as *AssetSet, prop AssetProperty) map[string]*ResourceTotals {
+	rts := map[string]*ResourceTotals{}
+
+	as.Each(func(name string, asset Asset) {
 		if node, ok := asset.(*Node); ok {
 			// Default to computing totals by Cluster, but allow override to use Node.
 			key := node.Properties().Cluster
@@ -80,7 +121,7 @@ func ComputeResourceTotals(as *AssetSet, prop AssetProperty) map[string]*Resourc
 					End:     node.End(),
 					Cluster: node.Properties().Cluster,
 					Node:    node.Properties().Name,
-					CPUCost: node.CPUCost,
+					CPUCost: cpuCost,
 					RAMCost: ramCost,
 					GPUCost: gpuCost,
 				}
@@ -89,6 +130,30 @@ func ComputeResourceTotals(as *AssetSet, prop AssetProperty) map[string]*Resourc
 	})
 
 	return rts
+}
+
+// ComputeIdleCoefficients returns the idle coefficients for CPU, GPU, and RAM
+// (in that order) for the given resource costs and totals.
+func ComputeIdleCoefficients(key string, cpuCost, gpuCost, ramCost float64, allocationTotals map[string]*ResourceTotals) (float64, float64, float64) {
+	var cpuCoeff, gpuCoeff, ramCoeff float64
+
+	if _, ok := allocationTotals[key]; !ok {
+		return 0.0, 0.0, 0.0
+	}
+
+	if allocationTotals[key].CPUCost > 0 {
+		cpuCoeff = cpuCost / allocationTotals[key].CPUCost
+	}
+
+	if allocationTotals[key].GPUCost > 0 {
+		gpuCoeff = cpuCost / allocationTotals[key].GPUCost
+	}
+
+	if allocationTotals[key].RAMCost > 0 {
+		ramCoeff = ramCost / allocationTotals[key].RAMCost
+	}
+
+	return cpuCoeff, gpuCoeff, ramCoeff
 }
 
 type ResourceTotalsStore interface {

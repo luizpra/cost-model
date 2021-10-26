@@ -380,31 +380,34 @@ func (sas *SummaryAllocationSet) AggregateBy(aggregateBy []string, options *Allo
 	sas.Lock()
 	defer sas.Unlock()
 
+	// TODO
+	log.Infof("SummaryAllocation: idle: %s (%d idle allocs)", options.ShareIdle, len(sas.idleKeys))
+
 	// (1) Loop and find all of the external, idle, and shared allocations. Add
 	// them to their respective sets, removing them from the set of allocations
 	// to aggregate.
-	for _, alloc := range sas.SummaryAllocations {
+	for _, sa := range sas.SummaryAllocations {
 		// External allocations get aggregated post-hoc (see step 6) and do
 		// not necessarily contain complete sets of properties, so they are
 		// moved to a separate AllocationSet.
-		if alloc.IsExternal() {
-			delete(sas.externalKeys, alloc.Name)
-			delete(sas.SummaryAllocations, alloc.Name)
-			externalSet.Insert(alloc)
+		if sa.IsExternal() {
+			delete(sas.externalKeys, sa.Name)
+			delete(sas.SummaryAllocations, sa.Name)
+			externalSet.Insert(sa)
 			continue
 		}
 
 		// Idle allocations should be separated into idleSet if they are to be
 		// shared later on. If they are not to be shared, then add them to the
 		// aggSet like any other allocation.
-		if alloc.IsIdle() {
-			delete(sas.idleKeys, alloc.Name)
-			delete(sas.SummaryAllocations, alloc.Name)
+		if sa.IsIdle() {
+			delete(sas.idleKeys, sa.Name)
+			delete(sas.SummaryAllocations, sa.Name)
 
 			if options.ShareIdle == ShareEven || options.ShareIdle == ShareWeighted {
-				idleSet.Insert(alloc)
+				idleSet.Insert(sa)
 			} else {
-				aggSet.Insert(alloc)
+				aggSet.Insert(sa)
 			}
 
 			continue
@@ -419,47 +422,55 @@ func (sas *SummaryAllocationSet) AggregateBy(aggregateBy []string, options *Allo
 	// (4) Distribute idle cost (TODO using precomputed)
 	// (5) Aggregate
 	for _, sa := range sas.SummaryAllocations {
+		log.Infof("SummaryAllocation: %d idle allocations", len(idleSet.SummaryAllocations))
+
 		// (4) Distribute idle allocations according to the idle coefficients
 		// NOTE: if idle allocation is off (i.e. ShareIdle == ShareNone) then
 		// all idle allocations will be in the aggSet at this point, so idleSet
 		// will be empty and we won't enter this block.
-		// if idleSet.Length() > 0 {
-		// 	// Distribute idle allocations by coefficient per-idleId, per-allocation
-		// 	for _, idleAlloc := range idleSet.allocations {
-		// 		// Only share idle if the idleId matches; i.e. the allocation
-		// 		// is from the same idleId as the idle costs
-		// 		iaidleId, err := idleAlloc.getIdleId(options)
-		// 		if err != nil {
-		// 			log.Errorf("AllocationSet.AggregateBy: Idle allocation is missing idleId %s", idleAlloc.Name)
-		// 			return err
-		// 		}
+		if len(idleSet.SummaryAllocations) > 0 {
+			// Distribute idle allocations by coefficient per-idleId, per-allocation
+			for _, idleAlloc := range idleSet.SummaryAllocations {
+				var allocTotals map[string]*ResourceTotals
+				var key string
 
-		// 		if iaidleId != idleId {
-		// 			continue
-		// 		}
+				// Only share idleAlloc with current allocation (sa) if the
+				// relevant property matches (i.e. Cluster or Node, depending
+				// on which idle sharing option is selected)
+				if options.IdleByNode {
+					if idleAlloc.Properties.Node != sa.Properties.Node {
+						continue
+					}
 
-		// 		// Make sure idle coefficients exist
-		// 		if _, ok := idleCoefficients[idleId]; !ok {
-		// 			log.Warningf("AllocationSet.AggregateBy: error getting idle coefficient: no idleId '%s' for '%s'", idleId, alloc.Name)
-		// 			continue
-		// 		}
-		// 		if _, ok := idleCoefficients[idleId][alloc.Name]; !ok {
-		// 			log.Warningf("AllocationSet.AggregateBy: error getting idle coefficient for '%s'", alloc.Name)
-		// 			continue
-		// 		}
+					key = idleAlloc.Properties.Node
 
-		// 		alloc.CPUCoreHours += idleAlloc.CPUCoreHours * idleCoefficients[idleId][alloc.Name]["cpu"]
-		// 		alloc.GPUHours += idleAlloc.GPUHours * idleCoefficients[idleId][alloc.Name]["gpu"]
-		// 		alloc.RAMByteHours += idleAlloc.RAMByteHours * idleCoefficients[idleId][alloc.Name]["ram"]
+					allocTotals = options.AllocationResourceTotalsStore.GetResourceTotalsByNode(*sas.Window.Start(), *sas.Window.End())
+					if allocTotals == nil {
+						// TODO
+						log.Warningf("SummaryAllocation: nil allocTotals by node for %s", sas.Window)
+					}
+				} else {
+					if idleAlloc.Properties.Cluster != sa.Properties.Cluster {
+						continue
+					}
 
-		// 		idleCPUCost := idleAlloc.CPUCost * idleCoefficients[idleId][alloc.Name]["cpu"]
-		// 		idleGPUCost := idleAlloc.GPUCost * idleCoefficients[idleId][alloc.Name]["gpu"]
-		// 		idleRAMCost := idleAlloc.RAMCost * idleCoefficients[idleId][alloc.Name]["ram"]
-		// 		alloc.CPUCost += idleCPUCost
-		// 		alloc.GPUCost += idleGPUCost
-		// 		alloc.RAMCost += idleRAMCost
-		// 	}
-		// }
+					key = idleAlloc.Properties.Cluster
+
+					allocTotals = options.AllocationResourceTotalsStore.GetResourceTotalsByCluster(*sas.Window.Start(), *sas.Window.End())
+					if allocTotals == nil {
+						// TODO
+						log.Warningf("SummaryAllocation: nil allocTotals by cluster for %s", sas.Window)
+					}
+				}
+
+				cpuCoeff, gpuCoeff, ramCoeff := ComputeIdleCoefficients(key, sa.CPUCost, sa.GPUCost, sa.RAMCost, allocTotals)
+				log.Infof("SummaryAllocation: idle coeffs for %s: %.3f, %.3f, %.3f", key, cpuCoeff, gpuCoeff, ramCoeff)
+
+				sa.CPUCost += idleAlloc.CPUCost * cpuCoeff
+				sa.GPUCost += idleAlloc.GPUCost * gpuCoeff
+				sa.RAMCost += idleAlloc.RAMCost * ramCoeff
+			}
+		}
 
 		// (5) generate key to use for aggregation-by-key and allocation name
 		key := sa.generateKey(aggregateBy, options.LabelConfig)
